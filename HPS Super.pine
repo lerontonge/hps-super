@@ -1,0 +1,456 @@
+//@version=6
+// ============================================================================
+// DTR / HPS "Super Signal" Toolkit
+// Independent re-creation of the rules shown in John Kurisko's (DayTraderRockStar)
+// "Desire To Trade" slide deck. NOT the proprietary NinjaTrader / alert-network code.
+//
+// WHAT IT DOES
+//  Everything lives in ONE oscillator pane below the chart (nothing is drawn on price):
+//  the 4 DTR stochastics (9-3, 14-3, 40-4, 60-10) with 20/80 lines, signal labels,
+//  TP1 / stop / exit markers, a background tint while a trade is active, and a status table
+//  (trend, position, stop price, exit mode). The 20/50/200 EMAs and VWAP are used for the
+//  logic only - add them to the price chart separately if you want to see them.
+//  Colours follow the Dracula theme; the status table is compact (hover cells for detail).
+//  A DXY-vs-gold relative strength line shares this pane: stochastic of (DXY / gold) so
+//  80+ means the dollar is extended versus gold, 20- means gold is extended versus the dollar.
+//
+// SIGNALS
+//  DIV         9-3 stochastic divergence (Lane): stage 1 under 20 -> bounce -> price makes a
+//              lower low / double bottom while the stoch holds above 20 with a higher low.
+//              Entry on the turn back up of the 9-3. (Mirrored for shorts.)
+//  QUAD DIV    DIV where all 4 stochastics were under the quad level at stage 1 ("Holy Grail").
+//  QUAD VWAP   Quad rotation (all 4 stochs hooking up from oversold) + price reclaiming VWAP.
+//  20/20 FLAG  Thrust off the 20 EMA, price above the 50 EMA, 60-10 holding >= 85,
+//              9-3 rotating back to ~20 / price touching the 20 EMA. (Bear flag mirrored.)
+//  SUPER       Alert = QUAD DIV or QUAD VWAP (divergence/VWAP setup merged with a quad rotation).
+//
+// RISK / EXIT (from the deck)
+//  Stop     : N ticks beyond the pattern extreme candle.
+//  TP1      : first 9-3 rotation back through 80 (long) / 20 (short).
+//  Exit mode depends on trend (price vs 200 EMA at entry):
+//    counter-trend -> take TP1, then stop to break-even
+//    with-trend    -> give room; exit on 60-10 rotation back through 80 (long) / 20 (short)
+//
+// NOT CODED (deck gives no numeric definition): coils, 1-2-3 channels, rising/falling
+// wedges, trendline-based setups. Educational tool only - backtest before using real money.
+// ============================================================================
+indicator("DTR HPS Super Signal Toolkit", shorttitle="HPS Super", overlay=false)
+
+// Dracula palette (chart settings to match: background #282A36, grid #44475A, text #F8F8F2)
+drBg      = #282A36
+drLine    = #44475A
+drFg      = #F8F8F2
+drComment = #6272A4
+drCyan    = #8BE9FD
+drGreen   = #50FA7B
+drOrange  = #FFB86C
+drPink    = #FF79C6
+drPurple  = #BD93F9
+drRed     = #FF5555
+drYellow  = #F1FA8C
+
+// ============================================================================
+// INPUTS
+// ============================================================================
+GS = "1 | Stochastics (DTR set)"
+GT = "2 | Trend / flag EMAs (logic only)"
+GD = "3 | Divergence engine"
+GF = "4 | Optional confirmation filters"
+GL = "5 | 20/20 flags"
+GQ = "6 | Quad rotation / VWAP"
+GM = "7 | Stops, exits & signal timing"
+GR = "8 | DXY vs Gold relative strength"
+
+s1K = input.int(9,  "9-3 : %K length / smoothing",  minval=1, group=GS, inline="a")
+s1S = input.int(3,  "",                             minval=1, group=GS, inline="a")
+s2K = input.int(14, "14-3 : %K length / smoothing", minval=1, group=GS, inline="b")
+s2S = input.int(3,  "",                             minval=1, group=GS, inline="b")
+s3K = input.int(40, "40-4 : %K length / smoothing", minval=1, group=GS, inline="c")
+s3S = input.int(4,  "",                             minval=1, group=GS, inline="c")
+s4K = input.int(60, "60-10 : %K length / smoothing", minval=1, group=GS, inline="d")
+s4S = input.int(10, "",                              minval=1, group=GS, inline="d")
+osLevel = input.float(20.0, "Oversold line",   group=GS)
+obLevel = input.float(80.0, "Overbought line", group=GS)
+
+e1Len   = input.int(20,  "Fast EMA",   minval=1, group=GT)
+e2Len   = input.int(50,  "Medium EMA", minval=1, group=GT)
+e3Len   = input.int(200, "Slow EMA (trend filter)", minval=1, group=GT)
+
+pivL      = input.int(3, "Stochastic pivot: left bars", minval=1, group=GD)
+maxGap    = input.int(60, "Max bars between stage 1 and stage 2", minval=5, group=GD)
+needHold  = input.bool(true, "Stage-2 stoch low must hold above the 20 line (uncheck for classic Lane)", group=GD)
+tolAtr    = input.float(0.15, "Double-bottom tolerance (x ATR14)", minval=0.0, step=0.05, group=GD)
+quadLvl   = input.float(20.0, "Quad level: all 4 stochs beyond this line at stage 1", group=GD)
+showBasic = input.bool(true, "Show plain 9-3 divergences (non-quad)", group=GD)
+
+use1   = input.bool(false, "Require higher-TF stoch #1 turning with trade", group=GF, inline="h1")
+htf1   = input.timeframe("5", "", group=GF, inline="h1")
+use2   = input.bool(false, "Require higher-TF stoch #2 turning with trade", group=GF, inline="h2")
+htf2   = input.timeframe("60", "", group=GF, inline="h2")
+htfK   = input.int(14, "Higher-TF stoch %K length", minval=1, group=GF)
+htfS   = input.int(3,  "Higher-TF stoch smoothing", minval=1, group=GF)
+htfBuf = input.float(10.0, "'Off oversold' buffer (points beyond 20/80)", minval=0.0, group=GF)
+useRev = input.bool(false, "Require a reversal candle at the extreme", group=GF)
+
+showFlags  = input.bool(true, "Show 20/20 bull & bear flags", group=GL)
+slopeLen   = input.int(10, "20 EMA slope lookback (bars)", minval=1, group=GL)
+flagLook   = input.int(30, "Look for the thrust within (bars)", minval=2, group=GL)
+thrustMult = input.float(1.5, "Thrust: EMA slope vs its 100-bar average (x)", minval=0.5, step=0.1, group=GL)
+slowMin    = input.float(85.0, "60-10 must hold at/above (shorts: 100 minus this)", group=GL)
+medMin     = input.float(0.0, "40-4 minimum (0 = off, 80 = 'strong' version)", group=GL)
+nearTol    = input.float(5.0, "9-3 trigger: within X points of the 20/80 line", minval=0.0, group=GL)
+flagCool   = input.int(10, "Cooldown bars between flag signals", minval=0, group=GL)
+
+showQuadVwap = input.bool(true, "Show Quad VWAP signals", group=GQ)
+rotBars      = input.int(10, "Quad rotation: each stoch must have reached the zone within N bars", minval=1, group=GQ)
+syncBars     = input.int(3, "Rotation / setup sync window (bars)", minval=0, group=GQ)
+
+trackTrades  = input.bool(true, "Track stop / TP1 / exit markers", group=GM)
+stopTicks    = input.int(1, "Stop distance beyond pattern extreme (ticks)", minval=0, group=GM)
+patBars      = input.int(5, "Pattern-extreme lookback for non-divergence setups (bars)", minval=1, group=GM)
+barCloseOnly = input.bool(true, "Signals only on bar close (no repainting)", group=GM)
+
+showRs   = input.bool(true, "Plot DXY vs Gold relative strength", group=GR)
+dxySym   = input.symbol("TVC:DXY", "DXY (USD index)", group=GR)
+goldSym  = input.symbol("TVC:GOLD", "Gold (spot / XAUUSD)", group=GR, tooltip="TVC:GOLD is spot gold and loads on every TradingView plan. Switch this to your broker's XAUUSD (for example OANDA:XAUUSD) if you want that exact feed.")
+rsLen    = input.int(14, "RS lookback", minval=2, group=GR, tooltip="Stochastic of the DXY/gold ratio. High = USD outperforming gold over this window. Low = gold outperforming USD.")
+rsSmooth = input.int(3, "RS smoothing", minval=1, group=GR)
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+f_stoch(int len, int sm) => ta.sma(ta.stoch(close, high, low, len), sm)
+
+// One-shot filter with cooldown
+f_once(bool raw, int cool) =>
+    var int last = na
+    bool ok = raw and (na(last) or bar_index - last > cool)
+    if ok
+        last := bar_index
+    ok
+
+// Bullish divergence engine. Short side is run on mirrored series
+// (stoch -> 100 - stoch, px -> -high), so one function serves both directions.
+// st       : stochastic series (9-3)
+// px       : price series where "lower" = more extreme (low for longs, -high for shorts)
+// quadFlag : true while all 4 stochs sit in the quad zone
+// Returns  : [signal, stage-1 had quad alignment, pattern extreme in px space]
+f_div(float st, float px, bool quadFlag, float lvl, bool needHold, float tol, int maxBars, int pivL) =>
+    var float s1Val  = na
+    var float s1Px   = na
+    var int   s1Bar  = na
+    var bool  s1Quad = false
+    var float runMax = na
+    runMax := na(runMax) ? st : math.max(runMax, st)
+    bool  quadNear = ta.highest(quadFlag ? 1.0 : 0.0, 5) > 0
+    float pl       = ta.pivotlow(st, pivL, 1)
+    float pxExt    = ta.lowest(px, 3)
+    bool  sig      = false
+    bool  sigQuad  = false
+    float sigExt   = na
+    if not na(pl)
+        int  pivBar = bar_index - 1
+        bool hasS1  = not na(s1Val) and (pivBar - s1Bar) <= maxBars
+        if hasS1 and runMax > lvl and pl > s1Val and (not needHold or pl >= lvl) and pxExt <= s1Px + tol
+            sig     := true
+            sigQuad := s1Quad
+            sigExt  := pxExt
+        if pl < lvl
+            s1Val  := pl
+            s1Px   := pxExt
+            s1Bar  := pivBar
+            s1Quad := quadNear[1]
+            runMax := math.max(st, st[1])
+        else if sig
+            s1Val := na
+    [sig, sigQuad, sigExt]
+
+// Higher-timeframe stochastic pack (previous COMPLETED bars only -> no repaint)
+f_htfPack() =>
+    float st = f_stoch(htfK, htfS)
+    [st[1], st[2], ta.lowest(st, 6)[1], ta.highest(st, 6)[1]]
+
+// ============================================================================
+// CORE CALCULATIONS
+// ============================================================================
+s1 = f_stoch(s1K, s1S)
+s2 = f_stoch(s2K, s2S)
+s3 = f_stoch(s3K, s3S)
+s4 = f_stoch(s4K, s4S)
+
+emaF = ta.ema(close, e1Len)
+emaM = ta.ema(close, e2Len)
+emaS = ta.ema(close, e3Len)
+vwapV = ta.vwap(hlc3)
+atr14 = ta.atr(14)
+
+bool upTrend = close > emaS
+bool dnTrend = close < emaS
+bool gate    = not barCloseOnly or barstate.isconfirmed
+
+// Quad zone flags
+bool quadUnder = s1 < quadLvl and s2 < quadLvl and s3 < quadLvl and s4 < quadLvl
+bool quadOver  = s1 > 100 - quadLvl and s2 > 100 - quadLvl and s3 > 100 - quadLvl and s4 > 100 - quadLvl
+
+// ---- Higher-timeframe filters
+[h1c, h1p, h1lo, h1hi] = request.security(syminfo.tickerid, htf1, f_htfPack(), lookahead = barmerge.lookahead_on)
+[h2c, h2p, h2lo, h2hi] = request.security(syminfo.tickerid, htf2, f_htfPack(), lookahead = barmerge.lookahead_on)
+bool h1OkL = not use1 or (h1c > h1p and h1lo <= osLevel + htfBuf)
+bool h1OkS = not use1 or (h1c < h1p and h1hi >= obLevel - htfBuf)
+bool h2OkL = not use2 or (h2c > h2p and h2lo <= osLevel + htfBuf)
+bool h2OkS = not use2 or (h2c < h2p and h2hi >= obLevel - htfBuf)
+
+// ---- Reversal candle filter
+float body    = math.abs(close - open)
+float rng     = high - low
+float lowWick = math.min(open, close) - low
+float upWick  = high - math.max(open, close)
+bool bullRev = rng > 0 and ((lowWick >= 2 * body and close > low + rng * 0.5) or (close > open and close[1] < open[1] and close >= open[1] and open <= close[1]))
+bool bearRev = rng > 0 and ((upWick >= 2 * body and close < high - rng * 0.5) or (close < open and close[1] > open[1] and close <= open[1] and open >= close[1]))
+bool revOkL = not useRev or bullRev or bullRev[1] or bullRev[2]
+bool revOkS = not useRev or bearRev or bearRev[1] or bearRev[2]
+
+// ============================================================================
+// DIVERGENCE SIGNALS
+// ============================================================================
+float tol = tolAtr * atr14
+[dLraw, dLq, dLext]  = f_div(s1, low, quadUnder, osLevel, needHold, tol, maxGap, pivL)
+[dSraw, dSq, dSextM] = f_div(100 - s1, -high, quadOver, 100 - obLevel, needHold, tol, maxGap, pivL)
+float dSext = -dSextM
+
+bool divL = gate and dLraw and h1OkL and h2OkL and revOkL
+bool divS = gate and dSraw and h1OkS and h2OkS and revOkS
+bool quadDivL = divL and dLq
+bool quadDivS = divS and dSq
+bool basicL   = showBasic and divL and not dLq
+bool basicS   = showBasic and divS and not dSq
+
+// ============================================================================
+// 20/20 BULL / BEAR FLAG
+// ============================================================================
+float emaSlope = emaF - emaF[slopeLen]
+float avgSlope = ta.sma(math.abs(emaSlope), 100)
+float slopeHi  = ta.highest(emaSlope, flagLook)
+float slopeLo  = ta.lowest(emaSlope, flagLook)
+bool thrustUp  = slopeHi > thrustMult * avgSlope
+bool thrustDn  = slopeLo < -thrustMult * avgSlope
+
+bool s1DipX   = ta.crossunder(s1, osLevel + nearTol)
+bool s1PopX   = ta.crossover(s1, obLevel - nearTol)
+bool touchEmaL = low <= emaF and low[1] > emaF[1]
+bool touchEmaS = high >= emaF and high[1] < emaF[1]
+
+bool flagSetL = thrustUp and close > emaM and s4 >= slowMin and s3 >= medMin
+bool flagSetS = thrustDn and close < emaM and s4 <= 100 - slowMin and s3 <= 100 - medMin
+bool flagRawL = f_once(gate and flagSetL and (s1DipX or touchEmaL), flagCool)
+bool flagRawS = f_once(gate and flagSetS and (s1PopX or touchEmaS), flagCool)
+bool flagL = showFlags and flagRawL
+bool flagS = showFlags and flagRawS
+
+// ============================================================================
+// QUAD ROTATION + VWAP
+// ============================================================================
+bool rise4 = s1 > s1[1] and s2 > s2[1] and s3 > s3[1] and s4 > s4[1]
+bool fall4 = s1 < s1[1] and s2 < s2[1] and s3 < s3[1] and s4 < s4[1]
+float lo1 = ta.lowest(s1, rotBars)
+float lo2 = ta.lowest(s2, rotBars)
+float lo3 = ta.lowest(s3, rotBars)
+float lo4 = ta.lowest(s4, rotBars)
+float hi1 = ta.highest(s1, rotBars)
+float hi2 = ta.highest(s2, rotBars)
+float hi3 = ta.highest(s3, rotBars)
+float hi4 = ta.highest(s4, rotBars)
+bool dip4 = lo1 < quadLvl and lo2 < quadLvl and lo3 < quadLvl and lo4 < quadLvl
+bool top4 = hi1 > 100 - quadLvl and hi2 > 100 - quadLvl and hi3 > 100 - quadLvl and hi4 > 100 - quadLvl
+bool qrL = rise4 and dip4
+bool qrS = fall4 and top4
+bool qrStartL = gate and qrL and not qrL[1]
+bool qrStartS = gate and qrS and not qrS[1]
+bool qrRecL = nz(ta.barssince(qrL), 9999) <= syncBars
+bool qrRecS = nz(ta.barssince(qrS), 9999) <= syncBars
+
+bool vwTouchL = not na(vwapV) and low <= vwapV and close > vwapV
+bool vwTouchS = not na(vwapV) and high >= vwapV and close < vwapV
+bool qvRawL = f_once(gate and vwTouchL and qrRecL, 10)
+bool qvRawS = f_once(gate and vwTouchS and qrRecS, 10)
+bool quadVwapL = showQuadVwap and qvRawL
+bool quadVwapS = showQuadVwap and qvRawS
+
+// ============================================================================
+// SUPER SIGNAL
+// ============================================================================
+bool superL = quadDivL or quadVwapL
+bool superS = quadDivS or quadVwapS
+
+// ============================================================================
+// DXY vs GOLD RELATIVE STRENGTH
+// Ratio rises when the dollar outperforms gold. A stochastic of that ratio
+// maps it onto the same 0-100 scale as the DTR stochastics.
+// ============================================================================
+float dxyClose  = request.security(dxySym, timeframe.period, close, gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+float goldClose = request.security(goldSym, timeframe.period, close, gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+float rsRatio   = goldClose > 0 ? dxyClose / goldClose : na
+float dxyGoldRs = ta.sma(ta.stoch(rsRatio, rsRatio, rsRatio, rsLen), rsSmooth)
+bool  usdLeads  = dxyGoldRs >= 50
+bool  usdHot    = dxyGoldRs >= obLevel
+bool  goldHot   = dxyGoldRs <= osLevel
+
+// ============================================================================
+// STOP / EXIT TRACKING
+// ============================================================================
+bool entryL = basicL or quadDivL or quadVwapL or flagL
+bool entryS = basicS or quadDivS or quadVwapS or flagS
+
+float genLow  = ta.lowest(low, patBars)
+float genHigh = ta.highest(high, patBars)
+bool  xUp9    = ta.crossover(s1, obLevel)
+bool  xDn9    = ta.crossunder(s1, osLevel)
+bool  xDn60   = ta.crossunder(s4, obLevel)
+bool  xUp60   = ta.crossover(s4, osLevel)
+
+float tk       = stopTicks * syminfo.mintick
+float newStopL = (divL ? dLext : genLow) - tk
+float newStopS = (divS ? dSext : genHigh) + tk
+
+var int   tDir   = 0
+var float tEntry = na
+var float tStop  = na
+var bool  tTp1   = false
+var bool  tWith  = false
+
+bool hitSL = false
+bool hitSS = false
+bool tp1L  = false
+bool tp1S  = false
+bool exL   = false
+bool exS   = false
+
+if trackTrades
+    if tDir == 1
+        if low <= tStop
+            hitSL := true
+            tDir  := 0
+        else
+            if not tTp1 and xUp9
+                tTp1 := true
+                tp1L := true
+                if not tWith
+                    tStop := math.max(tStop, tEntry)
+            if tWith and xDn60
+                exL  := true
+                tDir := 0
+    else if tDir == -1
+        if high >= tStop
+            hitSS := true
+            tDir  := 0
+        else
+            if not tTp1 and xDn9
+                tTp1 := true
+                tp1S := true
+                if not tWith
+                    tStop := math.min(tStop, tEntry)
+            if tWith and xUp60
+                exS  := true
+                tDir := 0
+    if entryL and tDir != 1
+        tDir   := 1
+        tEntry := close
+        tStop  := newStopL
+        tTp1   := false
+        tWith  := upTrend
+    else if entryS and tDir != -1
+        tDir   := -1
+        tEntry := close
+        tStop  := newStopS
+        tTp1   := false
+        tWith  := dnTrend
+
+// ============================================================================
+// PLOTS - STOCHASTIC LINES
+// ============================================================================
+plot(s1, "Fast 9-3",    color=drRed, linewidth=1)
+plot(s2, "Fast 14-3",   color=drGreen, linewidth=1)
+plot(s3, "Fast 40-4",   color=drCyan, linewidth=2)
+plot(s4, "Full 60-10",  color=drPink, linewidth=2)
+h80 = hline(obLevel, "Overbought", color=drComment, linestyle=hline.style_dashed)
+h20 = hline(osLevel, "Oversold",   color=drComment, linestyle=hline.style_dashed)
+hline(50, "Mid", color=drLine, linestyle=hline.style_dotted)
+fill(h80, h20, color=color.new(drPurple, 90), title="Neutral zone")
+
+plot(showRs ? dxyGoldRs : na, "DXY vs Gold RS", color=usdLeads ? drYellow : drPurple, linewidth=2)
+
+plotshape(qrStartL, title="Quad rotation up",   style=shape.circle, location=location.bottom, color=drGreen, size=size.tiny)
+plotshape(qrStartS, title="Quad rotation down", style=shape.circle, location=location.top,    color=drRed, size=size.tiny)
+
+// ============================================================================
+// PLOTS - SIGNALS & TRADE MARKERS (inside the oscillator pane)
+// Markers sit on the 9-3 line at the bar where they fire.
+// ============================================================================
+color colL = drGreen
+color colS = drRed
+
+bgcolor(trackTrades and tDir == 1 ? color.new(drGreen, 90) : trackTrades and tDir == -1 ? color.new(drRed, 90) : na, title="Trade active")
+
+plotshape(basicL ? s1 : na, title="DIV long",  style=shape.triangleup,   location=location.absolute, color=colL, text="DIV", textcolor=colL, size=size.tiny)
+plotshape(basicS ? s1 : na, title="DIV short", style=shape.triangledown, location=location.absolute, color=colS, text="DIV", textcolor=colS, size=size.tiny)
+
+plotshape(quadDivL ? s1 : na, title="QUAD DIV long",  style=shape.labelup,   location=location.absolute, color=colL, text="QUAD DIV", textcolor=drBg, size=size.small)
+plotshape(quadDivS ? s1 : na, title="QUAD DIV short", style=shape.labeldown, location=location.absolute, color=colS, text="QUAD DIV", textcolor=drBg, size=size.small)
+
+plotshape(quadVwapL ? s1 : na, title="QUAD VWAP long",  style=shape.labelup,   location=location.absolute, color=colL, text="QUAD VWAP", textcolor=drBg, size=size.small)
+plotshape(quadVwapS ? s1 : na, title="QUAD VWAP short", style=shape.labeldown, location=location.absolute, color=colS, text="QUAD VWAP", textcolor=drBg, size=size.small)
+
+plotshape(flagL ? s1 : na, title="20/20 bull flag", style=shape.labelup,   location=location.absolute, color=color.new(colL, 20), text="20/20 FLAG", textcolor=drBg, size=size.small)
+plotshape(flagS ? s1 : na, title="20/20 bear flag", style=shape.labeldown, location=location.absolute, color=color.new(colS, 20), text="20/20 FLAG", textcolor=drBg, size=size.small)
+
+plotshape(tp1L ? s1 : na, title="TP1 long",  style=shape.diamond, location=location.absolute, color=drYellow, text="TP1", textcolor=drYellow, size=size.tiny)
+plotshape(tp1S ? s1 : na, title="TP1 short", style=shape.diamond, location=location.absolute, color=drYellow, text="TP1", textcolor=drYellow, size=size.tiny)
+plotshape(hitSL ? s1 : na, title="Stop long",  style=shape.xcross, location=location.absolute, color=drRed, text="SL", textcolor=drRed, size=size.tiny)
+plotshape(hitSS ? s1 : na, title="Stop short", style=shape.xcross, location=location.absolute, color=drRed, text="SL", textcolor=drRed, size=size.tiny)
+plotshape(exL ? s1 : na, title="60-10 exit long",  style=shape.square, location=location.absolute, color=drOrange, text="EXIT", textcolor=drOrange, size=size.tiny)
+plotshape(exS ? s1 : na, title="60-10 exit short", style=shape.square, location=location.absolute, color=drOrange, text="EXIT", textcolor=drOrange, size=size.tiny)
+
+// ============================================================================
+// STATUS TABLE ("Important first step: determine if there is a trending market")
+// ============================================================================
+var table info = table.new(position.top_right, 4, 3, bgcolor=drBg, frame_color=drLine, frame_width=1, border_color=drLine, border_width=1)
+if barstate.islast
+    color trendClr = upTrend ? drGreen : dnTrend ? drRed : drComment
+    color posClr   = tDir == 1 ? drGreen : tDir == -1 ? drRed : drComment
+    string trendTxt = upTrend ? "UP" : dnTrend ? "DOWN" : "FLAT"
+    string posTxt   = tDir == 1 ? "LONG" : tDir == -1 ? "SHORT" : "FLAT"
+    string stopTxt  = tDir != 0 ? str.tostring(tStop, format.mintick) : "-"
+    string modeTxt  = tDir == 0 ? "-" : tWith ? "TRAIL 60-10" : "TP1 > BE"
+    string rsTxt    = not showRs or na(dxyGoldRs) ? "-" : str.tostring(dxyGoldRs, "#.0")
+    string rsBias   = not showRs or na(dxyGoldRs) ? "-" : usdHot ? "USD HOT" : goldHot ? "GOLD HOT" : usdLeads ? "USD" : "GOLD"
+    color  rsClr    = not showRs or na(dxyGoldRs) ? drComment : usdLeads ? drYellow : drPurple
+    table.cell(info, 0, 0, "TREND", text_color=drComment, bgcolor=drBg, text_size=size.tiny, tooltip="Close vs the slow EMA - determine the trend first")
+    table.cell(info, 1, 0, trendTxt, text_color=trendClr, bgcolor=drBg, text_size=size.tiny)
+    table.cell(info, 2, 0, "POS", text_color=drComment, bgcolor=drBg, text_size=size.tiny)
+    table.cell(info, 3, 0, posTxt, text_color=posClr, bgcolor=drBg, text_size=size.tiny)
+    table.cell(info, 0, 1, "STOP", text_color=drComment, bgcolor=drBg, text_size=size.tiny)
+    table.cell(info, 1, 1, stopTxt, text_color=drFg, bgcolor=drBg, text_size=size.tiny)
+    table.cell(info, 2, 1, "EXIT", text_color=drComment, bgcolor=drBg, text_size=size.tiny)
+    table.cell(info, 3, 1, modeTxt, text_color=drYellow, bgcolor=drBg, text_size=size.tiny, tooltip="TRAIL 60-10: with-trend, give room and exit on the 60-10 rotation. TP1 > BE: counter-trend, take TP1 on the 9-3 rotation then move the stop to break-even.")
+    table.cell(info, 0, 2, "DXY/XAU", text_color=drComment, bgcolor=drBg, text_size=size.tiny, tooltip="Stochastic of DXY close / gold close. Above 50 the dollar is leading gold over the RS lookback. 80+ dollar extended, 20- gold extended.")
+    table.cell(info, 1, 2, rsTxt, text_color=rsClr, bgcolor=drBg, text_size=size.tiny)
+    table.cell(info, 2, 2, "LEAD", text_color=drComment, bgcolor=drBg, text_size=size.tiny)
+    table.cell(info, 3, 2, rsBias, text_color=rsClr, bgcolor=drBg, text_size=size.tiny)
+
+// ============================================================================
+// ALERTS
+// ============================================================================
+alertcondition(superL, "Super Signal LONG",  "HPS Super Signal LONG on {{ticker}} ({{interval}})")
+alertcondition(superS, "Super Signal SHORT", "HPS Super Signal SHORT on {{ticker}} ({{interval}})")
+alertcondition(quadDivL, "Quad Divergence LONG",  "HPS Quad Divergence LONG on {{ticker}} ({{interval}})")
+alertcondition(quadDivS, "Quad Divergence SHORT", "HPS Quad Divergence SHORT on {{ticker}} ({{interval}})")
+alertcondition(quadVwapL, "Quad VWAP LONG",  "HPS Quad VWAP LONG on {{ticker}} ({{interval}})")
+alertcondition(quadVwapS, "Quad VWAP SHORT", "HPS Quad VWAP SHORT on {{ticker}} ({{interval}})")
+alertcondition(flagL, "20/20 Bull Flag LONG",  "HPS 20/20 bull flag LONG on {{ticker}} ({{interval}})")
+alertcondition(flagS, "20/20 Bear Flag SHORT", "HPS 20/20 bear flag SHORT on {{ticker}} ({{interval}})")
+alertcondition(basicL, "9-3 Divergence LONG",  "HPS 9-3 divergence LONG on {{ticker}} ({{interval}})")
+alertcondition(basicS, "9-3 Divergence SHORT", "HPS 9-3 divergence SHORT on {{ticker}} ({{interval}})")
+alertcondition(qrStartL, "Quad Rotation UP",   "HPS quad rotation UP on {{ticker}} ({{interval}})")
+alertcondition(qrStartS, "Quad Rotation DOWN", "HPS quad rotation DOWN on {{ticker}} ({{interval}})")
+alertcondition(tp1L or tp1S, "TP1 reached", "HPS TP1 on {{ticker}} ({{interval}})")
+alertcondition(hitSL or hitSS, "Stop hit", "HPS stop hit on {{ticker}} ({{interval}})")
